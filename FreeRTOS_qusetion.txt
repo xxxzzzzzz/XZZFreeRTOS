@@ -1,0 +1,521 @@
+------------------------1.任务级别的临界段代码-------------------------
+
+taskENTER_CRITICAL(); //任务临界区开
+//初始化外设代码
+taskEXIT_CRITICAL(); //任务临界区关
+
+------------------------2.中断级别的临界段代码-------------------------
+中断级别的临界段代码是在中断中使用
+
+
+/*串口2接收中断函数*/
+void USART2_IRQHandler(void)
+{
+    uint32_t status_value; //定义个32位的变量 
+    status_value = taskENTER_CRITICAL_FROM_ISR();//打开中断临界段
+    num = num + 1； //保护计算过程
+    taskEXIT_CRITICAL_FROM_ISR(status_value);//退出中断临界段 
+}
+
+
+-----------------------3.在FreeRTOS 中，串口空闲中断只能接收一个字节问题，其实是堆的问题，记住是堆的问题，不是栈的问题-------------------------------
+
+/*串口4接收中断函数*/
+void UART4_IRQHandler(void)
+{
+    
+    uint32_t len = 0;
+    uint8_t clear_tmp;
+       
+    if(USART_GetITStatus(UART4, USART_IT_IDLE) != RESET) //串口接受中断改成串口IDLE中断
+    {
+        DMA_Cmd(DMA1_Stream2, DISABLE); //关闭DMA，准备重新配置DMA_BufferSize
+        clear_tmp=UART4->SR;
+        clear_tmp=UART4->DR; //软件序列清除IDLE标志位方式
+        DMA_ClearFlag(DMA1_Stream2,DMA_FLAG_TCIF2 | DMA_FLAG_FEIF2 |DMA_FLAG_DMEIF2 | DMA_FLAG_TEIF2 | DMA_FLAG_HTIF2);
+  
+        len = DMA_GetCurrDataCounter(DMA1_Stream2); //得到剩余缓存大小
+        Rlen = (DMA_BUFFER_LEN2 - len);
+
+        debug_printf("RLen = %d\r\n",Rlen);  //我们发现串口发送一帧10多个字节的数据，这儿只能得到1个字节长度，这是为什么呢?
+        
+    }
+    
+    DMA1_Stream2->NDTR = DMA_BUFFER_LEN2; //重新给DMA_BufferSize赋值，方便下次中断计算帧长度
+    DMA_Cmd(DMA1_Stream2, ENABLE);//打开DMA，准备重新配置
+}
+
+为什么串口空闲中断只能接收一个字节呢?
+
+我查阅startup_stm32f40_41xxx.s文件
+
+Heap_Size       EQU     0x000000200 //发现堆空间只有512字节，但是我的DMA缓冲区配置的就是512 
+
+(DMA_InitStructure.DMA_BufferSize = 512; //设置接收缓存为512字节  )。 所以DMA缓冲区占用的是堆，而不是栈。
+
+因为DMA缓存区抵进了堆的512字节，造成堆溢出。
+
+
+Heap_Size       EQU     0x0000001000 //将Heap_Size 改成1000就可以了
+
+
+
+
+----------------------------------------4.portYIELD_FROM_ISR(...)在中断中执行任务切换函数注意事项---------------------
+
+//定时器2中断服务函数
+void TIM2_IRQHandler(void)
+{
+    BaseType_t xTaskWorken;
+    
+    BaseType_t xHigherPriorityTaskWoken; //任务切换状态变量放在中断函数内部会出现卡死机器BUG
+
+    if(TIM_GetITStatus(TIM2,TIM_IT_Update)==SET) //溢出中断
+    {
+       
+        
+        TIM_ClearITPendingBit(TIM2,TIM_IT_Update);  //清除中断标志位
+            
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);//如果需要的话进行一次任务切换
+    }
+    
+}
+
+
+这是因为xHigherPriorityTaskWoken变量是记录中断上下文状态
+
+BaseType_t xHigherPriorityTaskWoken = false; //将任务状态变量定义在全局就可以正常工作了，最后先赋值为false。
+
+//定时器2中断服务函数
+void TIM2_IRQHandler(void)
+{
+    BaseType_t xTaskWorken;
+    
+    if(TIM_GetITStatus(TIM2,TIM_IT_Update)==SET) //溢出中断
+    {
+       
+        TIM_ClearITPendingBit(TIM2,TIM_IT_Update);  //清除中断标志位
+        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);//如果需要的话进行一次任务切换
+    }
+    
+}
+
+如果非要将xHigherPriorityTaskWoken放在中断函数内部，那么就要使用static 。如static  xHigherPriorityTaskWoken = false;
+
+
+
+---------------------------------------FreeRTOS 串口中断加入定时器造成接收数据卡死系统 --------------------------
+这个问题要分几步走
+1.串口接收中断会不会造成FreeRTOS系统卡死?  USART_ClearFlag清除中断标志位方式一定会卡死系统
+
+BaseType_t xHigherPriorityTaskWoken2 = 0; 
+
+/*串口4接收中断函数*/
+void UART4_IRQHandler(void)
+{
+       
+    if(USART_GetITStatus(UART4, USART_IT_RXNE) != RESET) //串口接受中断改成串口IDLE中断
+    {
+        USART_ClearFlag(UART4, USART_FLAG_TC); //清除串口4中断标志位, （注意，如果使用USART_ClearFlag清除中断标志位，一定卡死系统）
+        
+    }
+        
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken2); //让FreeRTOS自己确定要不要切换系统   
+    
+    
+}
+
+修改如下: 采用USART_ClearITPendingBit清除中断标志位
+
+/*串口4接收中断函数*/
+void UART4_IRQHandler(void)
+{
+       
+    if(USART_GetITStatus(UART4, USART_IT_RXNE) != RESET) //串口接受中断改成串口IDLE中断
+    {
+        
+        
+        USART_ClearITPendingBit(UART4,USART_IT_RXNE); //采用ClearITPendingBit，FreeRTOS系统不会卡死，正常工作
+                   
+    }
+          
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken2); //让FreeRTOS自己确定要不要切换系统   
+       
+}
+
+至于USART_ClearITPendingBit和USART_ClearFlag有什么区别，请看我F407操作手册讲解
+
+2.串口中断中加入FreeRTOS支持的二值信号量打印会不会出问题?
+/*串口4接收中断函数*/
+void UART4_IRQHandler(void)
+{
+    
+    uint32_t len = 0;
+    uint8_t clear_tmp;
+    uint32_t status_value;
+    
+    
+    if(USART_GetITStatus(UART4, USART_IT_RXNE) != RESET) //串口接受中断改成串口IDLE中断
+    {
+        
+        USART_ClearITPendingBit(UART4,USART_IT_RXNE); //清除中断标志位
+        debug_printf("IRQHandler\r\n"); //在FreeRTOS系统中，使用带有二值信号量的printf函数打印会造成死机
+        //如果改成普通的 printf 函数，可以在接收到数据的时候打印一次，然后进入死机状态。所以printf也不行。但是可以调试一下是否接收到字节。
+
+        UART4_DMArecv[Rlen] = USART_ReceiveData(UART4); //串口中断接收数据
+        
+    }
+       
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken2); //让FreeRTOS自己确定要不要切换系统   
+     
+}
+
+
+3.在串口接收中断函数中，启动定时器也会出现接收卡死系统现象。
+/*串口4接收中断函数*/
+void UART4_IRQHandler(void)
+{
+    
+    
+    if(USART_GetITStatus(UART4, USART_IT_RXNE) != RESET) //串口接受中断改成串口IDLE中断
+    {
+        USART_ClearITPendingBit(UART4,USART_IT_RXNE);
+                
+        UART4_DMArecv[Rlen] = USART_ReceiveData(UART4); //串口中断接收数据
+        Rlen++;
+        
+        if(Rlen == 1) //接收到第1个字节之后，采用定时器计算时间戳。(以前我都是用IDLE空闲中断来做，没有出现问题，现在用定时器就出现了问题)
+
+        {
+            TIM_ClearITPendingBit(TIM2,TIM_IT_Update);  //清除中断标志位
+            TIM_ITConfig(TIM2,TIM_IT_Update,ENABLE);  //定时器溢出中断打开
+            TIM_SetCounter(TIM2,0); //设置定时器2从0开始计数      
+            TIM_Cmd(TIM2, ENABLE);//使能启动定时器 2   
+        }
+        Time2Count = 0;        
+    }
+      
+    portYIELD_FROM_ISR(xHigherPriorityTaskWoken2); //让FreeRTOS自己确定要不要切换系统   
+    
+}
+
+这个问题主要是硬件中断优先级和FreeRTOS优先级冲突造成的
+定时器硬件中断优先级有关，因为串口和定时器硬件中断与FreeRTOS内核中断有冲突，导致串口接收到一帧数据后就卡死。
+
+NVIC_PriorityGroupConfig(NVIC_PriorityGroup_4);//初始化的时候中断分组改成组4，这样抢占中断有0~15个级别。
+为什么将中断分组从2改成4，是因为和FreeRTOS系统的内核中断有关，我们取消掉响应中断优先级，只使用抢占中断
+NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority=12; //将定时器抢占优先级 12
+NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority=13; //将串口抢占优先级改成13
+为什么串口和定时器的抢占优先级要改到11之后，这个后面再讲。
+
+抢占中断优先级修改后，串口每100ms接收一次数据是没有问题的。但是串口改成50ms接收一次数据就出问题了。
+该问题注意串口接收数组数据超量溢出问题。 接收数组改大，问题得到解决。
+
+4.现在回过头来讲讲串口硬件中断优先级和FreeRTOS内核中断优先级冲突的问题?
+4.1 FreeRTOSConfig.h中定义了两个宏，分别是：configKERNEL_INTERRUPT_PRIORITY和configMAX_SYSCALL_INTERRUPT_PRIORITY
+
+configKERNEL_INTERRUPT_PRIORITY用来设置RTOS内核自己的中断优先级，因为RTOS内核中断
+不允许抢占用户使用的中断，因此这个宏一般为硬件最低优先级
+
+configMAX_SYSCALL_INTERRUPT_PRIORITY  用来设置可以在中断服务程序中(如串口中断服务程序)安全调用API函数(如信号量ISR函数xSemaphoreGiveFromISR)最高优先级，如果硬件抢占中断优先级大于configMAX_SYSCALL_INTERRUPT_PRIORITY，
+FreeRtos将无法关闭该中断，不受FreeRtos控制。
+
+一般情况下 #define configMAX_SYSCALL_INTERRUPT_PRIORITY 191  (这个191 hex就是BF = 1011 1111) 这个1011会被写入FreeRTOS中断寄存器，所以SYSCALL_INTERRUPT_PRIORITY中断优先级为11。
+
+若是在中断函数中(如串口中断服务函数)使用了FreeRTOS的API函数，固然前提也是使用带FromISR后缀的(如xSemaphoreGiveFromISR)，那么串口中断的优先级不能高于宏定义configMAX_SYSCALL_INTERRUPT_PRIORITY。也就是串口的中断优先级不能小于11，定时器中断优先级也不能小于11。 那么串口和定时器能设置的中断优先级就只有11~15，为什么这么少? 因为中断分组初始化的NVIC_PriorityGroupConfig(NVIC_PriorityGroup_4); 也就是0~15个抢占中断，那么FreeRTOS占用了11( #define configMAX_SYSCALL_INTERRUPT_PRIORITY 191)，导致11之前的中断无法使用，硬件中断就只有使用11~15了。
+
+如果我将#define configMAX_SYSCALL_INTERRUPT_PRIORITY 95 //5F 0101 1111 现在向(5)0101 写入FreeRTOS中断寄存器。
+硬件中断的优先级设置范围就只有5~15
+
+NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority=6; //定时器抢占优先级 6 挨着FreeRTOS中断寄存器优先级5
+NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority=7; //串口抢占优先级 7
+只要没低于SconfigMAX_SYSCALL_INTERRUPT_PRIORITY的中断优先级，就能正常工作。所以6和7的硬件优先级没有问题
+
+NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority=2; //如果将定时器抢占优先级改成2
+NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority=7; //串口抢占优先级不变
+系统直接死机，因为定时器抢占优先级2，高于FreeRTOS内核中断优先级5，所以死机
+
+
+
+
+-----------------------------------FreeRTOS系统堆栈和任务堆栈分配不合理导致卡死问题---------------------------
+1.在FreeRTOSConfig.h中 #define configTOTAL_HEAP_SIZE ( ( size_t ) ( 3 * 1024 ) ) //TOTAL_HEAP_SIZE最小必须3K才能保证1个最小任务 运行
+
+void Task1(void)
+{
+    while(1)
+    {
+        debug_printf("Task11111111111\r\n");
+        vTaskDelay(100);
+    }
+}
+
+TaskReturn = xTaskCreate((TaskFunction_t)Task1, //任务函数地址
+                                                    (const char* )"Task1_Thread", //任务名
+                                                    (uint32_t)512, //任务栈大小
+                                                    (void*)NULL, //向函数传参
+                                                    (UBaseType_t)2, //优先级
+                                                    (TaskHandle_t* )&Task1TCB); //任务控制块
+
+一个512K的打印任务正常运行。
+
+/***********************************************************/
+
+2.我现在将任务栈扩充到1024字节
+TaskReturn = xTaskCreate((TaskFunction_t)Task1, //任务函数地址
+                                                    (const char* )"Task1_Thread", 
+                                                    (uint32_t)1024, //任务栈大小扩充到1024
+                                                    (void*)NULL, 
+                                                    (UBaseType_t)2, 
+                                                    (TaskHandle_t* )&Task1TCB); 
+系统开机直接卡死
+看来任务栈设置多大必须先看TOTAL_HEAP_SIZE大小
+    
+#define configTOTAL_HEAP_SIZE ( ( size_t ) ( 4 * 1024 ) )  //将TOTAL_HEAP_SIZE改成4K
+运行还是直接卡死
+
+#define configTOTAL_HEAP_SIZE ( ( size_t ) ( 5 * 1024 ) )  //将TOTAL_HEAP_SIZE改成5K
+系统运行正常
+
+我只是将任务栈增加了512字节，怎么TOTAL_HEAP_SIZE会增加2K呢? 请看下面测试
+
+/*****************************************************************/
+3.我将任务栈改成2K
+TaskReturn = xTaskCreate((TaskFunction_t)Task1, //任务函数地址
+                                                    (const char* )"Task1_Thread", 
+                                                    (uint32_t)2048, //任务栈大小，扩充到2K
+                                                    (void*)NULL, 
+                                                    (UBaseType_t)2, 
+                                                    (TaskHandle_t* )&Task1TCB);
+
+现在任务栈从1K扩充到2K，按照前面第3点的情况，我增加2K TOTAL_HEAP_SIZE
+
+#define configTOTAL_HEAP_SIZE ( ( size_t ) ( 7 * 1024) ) //TOTAL_HEAP_SIZE增加2K到7K
+我们发现任务直接卡死了。
+
+我怀疑是任务栈增加2K，TOTAL_HEAP_SIZE增加2K，处于任务栈统一大小，我怕溢出，下面我增加到8K
+#define configTOTAL_HEAP_SIZE ( ( size_t ) ( 8 * 1024) )
+增加到8K之后，任务还是卡死的。
+
+这样就奇怪了，任务栈增加1024 我TOTAL_HEAP_SIZE跟着任务线性增加2K或者3K都不行，好奇怪。
+
+答案: TOTAL_HEAP_SIZE分配的大小是字节为单位，如 configTOTAL_HEAP_SIZE ( ( size_t ) ( 8 * 1024) ) 就是8K
+      但是任务栈分配的最小单位是4字节
+如:
+TaskReturn = xTaskCreate((TaskFunction_t)Task1, //任务函数地址
+                                                    (const char* )"Task1_Thread", 
+                                                    (uint32_t)2048, //任务栈大小，扩充的并不是2K，而是2048 * 4 = 8192byte，也就是8K多一点。 
+                                                    (void*)NULL, 
+                                                    (UBaseType_t)2, 
+                                                    (TaskHandle_t* )&Task1TCB);
+那么任务栈如果分配2048，那么TOTAL_HEAP_SIZE 必须分配大于(2048 * 4)的空间，也就是8192字节，但是只要8192字节不行，因为还有任务切换，空闲任务的开销，所以 TOTAL_HEAP_SIZE必须分配到9K
+
+所以前面任务栈申请1024，那么TOTAL_HEAP_SIZE 就必须分配5K，就能说得通了。
+
+现在测试任务栈2048，TOTAL_HEAP_SIZE = 9K配置。 测试成功，没有问题。
+
+/******************************************************************/
+4. 如果是这样的话，我的任务栈分配512就差不多了。 512的任务栈。该任务栈就有2048字节的空间。
+   将TOTAL_HEAP_SIZE 改为3K。 现在来测试任务中使用数组。
+   记住这时候系统栈和堆还是很小哦。如: Stack_Size      EQU     0x00000000200
+                                    Heap_Size       EQU     0x0000000200
+
+   void Task1(void)
+   {
+       char buffer[1800] = {0}; //我定义个1800的数组，看看占用任务栈多大
+       while(1)
+       {
+        debug_printf("Task11111111111\r\n");
+        vTaskDelay(100);
+       }
+   }
+   TaskReturn = xTaskCreate((TaskFunction_t)Task1, //任务函数地址
+                                                    (const char* )"Task1_Thread", 
+                                                    (uint32_t)512, //任务栈大小2048
+                                                    (void*)NULL, 
+                                                    (UBaseType_t)2, 
+                                                    (TaskHandle_t* )&Task1TCB); 
+    程序运行正常。
+
+    void Task1(void)
+    {
+    char buffer[2048] = {0}; //我改成2048，占用完任务栈的大小
+    while(1)
+    {
+        debug_printf("Task11111111111\r\n");
+        vTaskDelay(100);
+    }
+    }
+
+程序运行卡死，因为debug_printf也会占用任务栈的空间。起码占用了100字节，所以卡死了。
+
+/****************************************************************************/
+
+5. 在任务栈中，函数调用，函数嵌套调用会不会影响任务栈。
+
+void test1(void)
+{
+    char buffer[2048] = {0}; //我将大数组放在调用函数里面，会不会影响调用的任务栈? 
+    debug_printf("test111111\r\n");
+}
+
+void Task1(void)
+{
+    while(1)
+    {
+        test1();
+        debug_printf("Task11111111111\r\n");
+        vTaskDelay(100);
+    }
+}
+
+程序运行卡死。看来子函数里面定义的数组内存，也会纳入调用它的任务栈空间。
+
+
+void test1(void)
+{
+    char buffer[1800] = {0}; //我将调用的函数数组改成1800
+    debug_printf("test111111\r\n");
+}
+
+void Task1(void)
+{
+    while(1)
+    {
+        test1();
+        debug_printf("Task11111111111\r\n");
+        vTaskDelay(100);
+    }
+}
+
+程序运行正常。 这样看来函数调用里面的数组，影响任务栈还是很大。
+
+/*****************************************************************/
+6. 如果是函数分开调用呢?
+void test1(void)
+{
+    char buffer[1800] = {0}; //我将大数组放在调用函数里面
+    debug_printf("test111111\r\n");
+}
+
+void test2(void)
+{
+    char buffer[1800] = {0}; //我将大数组放在调用函数里面
+    debug_printf("test222222\r\n");
+}
+
+void Task1(void)
+{
+    while(1)
+    {
+        test1(); //第1个函数执行完之后，将1800数组释放掉。
+        test2(); //第2个函数再申请1800个数组就没有问题。
+        debug_printf("Task11111111111\r\n");
+        vTaskDelay(100);
+    }
+}
+
+运行正常
+看来调用的函数执行完之后，会释放任务栈的空间。所以多个被调用的函数申请同样大的数组不会影响系统。
+
+/*****************************************************************/
+7. 全局变量会不会影响任务栈?
+
+unsigned int GLbuffer[10240] = {0}; //我申请全局数组10K
+
+void test1(void)
+{
+    char buffer[1800] = {0}; //我将大数组放在调用函数里面
+    
+    for(int i = 0; i < 10240 ; i++) //全局数组使用
+    {
+        GLbuffer[i] = i;
+    }
+    debug_printf("test111111\r\n");
+}
+
+void Task1(void)
+{
+    
+    while(1)
+    {
+        test1(); //第1个函数执行完之后，将1800数组释放掉。
+        debug_printf("Task11111111111\r\n");
+        vTaskDelay(100);
+    }
+}
+
+我GLbuffer申请了10K都不会影响只有任务栈2K的Task1任务
+而且我的Stack_Size      EQU     0x00000000200   (512字节)
+        Heap_Size       EQU     0x00000000200  (512字节)
+系统堆栈也只有512字节。
+看来全局数组只影响RAM的使用率。我编译出的ZI-data都被全局数组占用了40K。
+就算任务去调用带有全局数组的函数test1(),也不会造成任务栈溢出。全局数组就在RAM中，不在任务中。
+
+static unsigned int GLbuffer[10240] = {0}; //就算用static申请得全局数组，也不会影响任务栈。
+所以只有函数的局部变量和局部数组会影响任务栈，全局变量和全局数组不会影响任务栈。
+
+
+/*******************************************************************************/
+8.多个函数数组递归调用
+
+
+void test2(void)
+{
+    char buffer[1000] = {0}; //数组申请1K
+    debug_printf("test22222\r\n");
+}
+
+
+void test1(void)
+{
+    char buffer[1000] = {0}; //数组申请1K
+    debug_printf("test111111\r\n");
+    test2(); //test1调用test2
+}
+
+void Task1(void)
+{
+    while(1)
+    {
+        test1(); 
+        debug_printf("Task11111111111\r\n");
+        vTaskDelay(100);
+    }
+}
+
+TaskReturn = xTaskCreate((TaskFunction_t)Task1, //任务函数地址
+                                                    (const char* )"Task1_Thread", 
+                                                    (uint32_t)512, //任务栈大小2K
+                                                    (void*)NULL, 
+                                                    (UBaseType_t)2, 
+                                                    (TaskHandle_t* )&Task1TCB); 
+
+系统卡死，test1()在任务栈中申请了1K内存，然后test1()函数没有执行完，就去调用了test2(),test2()也在任务栈中申请了1K内存，这样就到这test2的1K和test的1K累加，达到了2K，因为test1没有执行完，所以这2K累加的栈空间占用了任务栈，系统卡死。
+这样看来函数递归调用还必须注意递归调用的函数是否也申请了任务栈空间。
+
+
+void test2(void)
+{
+    char buffer[500] = {0}; //将递归调用的test2()改成500字节
+    debug_printf("test22222\r\n");
+}
+
+void test1(void)
+{
+    char buffer[1000] = {0}; //数组申请1K
+    debug_printf("test111111\r\n");
+    test2();
+}
+
+void Task1(void)
+{
+    while(1)
+    {
+        test1(); 
+        debug_printf("Task11111111111\r\n");
+        vTaskDelay(100);
+    }
+}
+
+这样就是test1() 1K + test2() 500字节 = 1500K栈空间，没有超出任务栈2K的大小，运行正常。
