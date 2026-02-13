@@ -1,0 +1,101 @@
+在原版multi_timer.c中，有问题的代码如下：
+
+
+
+//最大时间
+static uint32_t _timer_ticks = 4294967290; 
+//初始化时间4294967290 = FFFF FFFA 过大 ，这种情况下循环累加一次就溢出，重大BUG。
+修改static uint32_t _timer_ticks = 0;
+
+
+//在loop循环中，_timer_ticks 超出最大值范围没有清0，造成变量溢出，同时timeout最大值的时候也未清0，造成变量溢出。
+void timer_loop()                                                       // 在While循环中使用，定时器才会起作用
+{
+    struct Timer* target;
+    for(target = head_handle; target; target = target->next)
+    {
+#if 1           
+        if(_timer_ticks >= target->timeout)
+#else
+            //_timer_ticks 这个变量会出现溢出的情况，因为它是32位的，所以不能大于0xFFFFFFFF = 4,294,967,295,
+            //一天有多少s, 24*60*60*1000 = 86,400,000s,也就是改变了一直累加49.7天就会溢出，4,294,967,295 / 86,400,000 = 49.71026961805556天
+              if((int)((uint32_t)(target->timeout -_timer_ticks)) <= 0)
+#endif
+        {
+            if(target->repeat == 0)
+            {
+                timer_stop(target);
+            }
+            else
+            {
+                target->timeout = _timer_ticks + target->repeat;
+            }
+            target->timeout_cb();
+        }
+    }
+}
+
+
+//////////////////修改方式如下//////////////////////////////////////
+
+
+//最大时间
+static uint32_t _timer_ticks = 0; //初始最大时间修改为0
+
+static uint8_t ticksflag = 0; //定义一个全局的清0变量
+
+/***********************************************************************
+  *   主函数调度循环 loop.
+  *   None.
+  *  None
+  **********************************************************************/
+void timer_loop()              // 在While循环中使用，定时器才会起作用
+{
+    struct Timer* target;
+    
+    if(_timer_ticks > 0xFFFF0000) //增加累计清除，避免BUG
+    {
+        _timer_ticks = 0;
+        ticksflag = 1;
+    }
+        
+    for(target = head_handle; target; target = target->next)
+    {
+            if(ticksflag == 1)//增加根据标志位清空timeout ++
+            {
+                target->timeout = 0;
+            }
+#if 1           
+        if(_timer_ticks >= target->timeout)
+#else
+            //_timer_ticks 这个变量会出现溢出的情况，因为它是32位的，所以不能大于0xFFFFFFFF = 4,294,967,295,
+            //一天有多少s, 24*60*60*1000 = 86,400,000s,也就是改变了一直累加49.7天就会溢出，4,294,967,295 / 86,400,000 = 49.71026961805556天
+              if((int)((uint32_t)(target->timeout -_timer_ticks)) <= 0)
+#endif
+        {
+            if(target->repeat == 0)
+            {
+                timer_stop(target);
+            }
+            else
+            {
+                if(target->timeout > 0xFFFF0000)//增加内容修改timeout溢出BUG
+                    target->timeout = target->repeat;                    
+                target->timeout = _timer_ticks + target->repeat;
+            }
+            target->timeout_cb();
+        }
+                
+    }
+        ticksflag = 0; //增加++
+}
+
+
+
+
+
+
+
+
+
+
